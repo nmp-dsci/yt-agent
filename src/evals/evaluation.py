@@ -3,12 +3,18 @@ from __future__ import annotations
 import argparse
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from src.agents.context import RawTranscriptContextProvider
-from src.agents.models import QuestionRequest, RagQuestionRequest
+from src.agents.models import (
+    FollowupSubtopic,
+    QuestionRequest,
+    RagQuestionRequest,
+    RecursionOptions,
+    RecursionTrace,
+)
 from src.agents.rag_transcript_agent import RagTranscriptAgent
 from src.agents.transcript_agent import TranscriptAgent
 from src.config import ConfigError, load_settings
@@ -19,6 +25,7 @@ from src.rag.eval import estimate_tokens
 from src.rag.indexing import RagIndexer
 from src.rag.references import youtube_timestamp_url
 from src.rag.storage import RawTranscriptStore, TranscriptChunkStore
+from src.rag.summaries import TranscriptSummaryStore
 from src.transcripts.fetcher import SuperdataTranscriptFetcher
 from src.transcripts.youtube import extract_video_id
 
@@ -39,10 +46,22 @@ class EvaluationRun:
     context_text: str
     retrieved_chunks: list[Any]
     source_url: str | None = None
+    recursion: RecursionTrace | None = None
+    subtopics: list[FollowupSubtopic] = field(default_factory=list)
 
     @property
     def token_estimate(self) -> int:
         return estimate_tokens(self.context_text)
+
+    @property
+    def total_llm_calls(self) -> int:
+        if self.recursion:
+            return sum(s.llm_calls for s in self.recursion.stages)
+        return 1
+
+    @property
+    def terminated_reason(self) -> str | None:
+        return self.recursion.terminated_reason if self.recursion else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +136,14 @@ def run_evaluation(
         overlap_chars=settings.chunk_overlap_chars,
     )
 
+    summary_store = TranscriptSummaryStore(
+        settings.chroma_path,
+        embedding_model=embedding_model,
+        embedding_model_name=settings.embedding_model,
+        raw_store=raw_store,
+        collection_name=settings.transcript_summary_collection,
+    )
+
     raw_agent = TranscriptAgent.from_settings(
         settings,
         RawTranscriptContextProvider(raw_store, fetcher),
@@ -136,7 +163,16 @@ def run_evaluation(
             raw_store=raw_store,
             chunk_store=chunk_store,
             indexer=indexer,
+            summary_store=summary_store,
         ),
+    )
+
+    recursion_options = RecursionOptions(
+        max_depth=settings.rag_max_depth,
+        max_followups=settings.rag_max_followups,
+        followup_top_k=settings.rag_followup_top_k,
+        novelty_min_chunks=settings.rag_novelty_min_chunks,
+        max_total_followups=settings.rag_max_total_followups,
     )
 
     raw_answer = raw_agent.answer(
@@ -145,13 +181,53 @@ def run_evaluation(
     rag_single_answer = rag_single_agent.answer(
         QuestionRequest(video_id=video_id, source_url=source_url, question=question)
     )
+
     rag_all_answer = rag_all_agent.answer(
         RagQuestionRequest(question=question, top_k=resolved_top_k)
     )
+    rag_all_context = rag_all_agent.last_context
+
+    rag_all_filtered_answer = rag_all_agent.answer(
+        RagQuestionRequest(
+            question=question,
+            top_k=resolved_top_k,
+            filter_transcripts=True,
+            transcript_filter_top_k=settings.transcript_filter_top_k,
+            transcript_filter_min_score=settings.transcript_filter_min_score,
+        )
+    )
+    rag_all_filtered_context = rag_all_agent.last_context
+
+    rag_recursive_answer = rag_all_agent.answer(
+        RagQuestionRequest(
+            question=question,
+            top_k=resolved_top_k,
+            recursive=True,
+            recursion_options=recursion_options,
+        )
+    )
+    rag_recursive_context = rag_all_agent.last_context
+
+    rag_recursive_filtered_answer = rag_all_agent.answer(
+        RagQuestionRequest(
+            question=question,
+            top_k=resolved_top_k,
+            recursive=True,
+            filter_transcripts=True,
+            transcript_filter_top_k=settings.transcript_filter_top_k,
+            transcript_filter_min_score=settings.transcript_filter_min_score,
+            recursion_options=recursion_options,
+        )
+    )
+    rag_recursive_filtered_context = rag_all_agent.last_context
+
     if (
         raw_agent.last_context is None
         or rag_single_agent.last_context is None
-        or rag_all_agent.last_context is None
+        or rag_all_context is None
+        or rag_all_filtered_context is None
+        or rag_recursive_context is None
+        or rag_recursive_filtered_context is None
     ):
         raise RuntimeError("Evaluation did not capture all context payloads")
 
@@ -175,10 +251,38 @@ def run_evaluation(
         EvaluationRun(
             name="rag_all",
             input_type="rag all",
-            source_url=None,
             answer=rag_all_answer.answer,
-            context_text=rag_all_agent.last_context.context_text or "",
-            retrieved_chunks=rag_all_agent.last_context.retrieved_chunks or [],
+            context_text=rag_all_context.context_text or "",
+            retrieved_chunks=rag_all_context.retrieved_chunks or [],
+            subtopics=rag_all_answer.subtopics,
+            recursion=rag_all_answer.recursion,
+        ),
+        EvaluationRun(
+            name="rag_all_filtered",
+            input_type="rag all filtered",
+            answer=rag_all_filtered_answer.answer,
+            context_text=rag_all_filtered_context.context_text or "",
+            retrieved_chunks=rag_all_filtered_context.retrieved_chunks or [],
+            subtopics=rag_all_filtered_answer.subtopics,
+            recursion=rag_all_filtered_answer.recursion,
+        ),
+        EvaluationRun(
+            name="rag_recursive",
+            input_type="rag recursive",
+            answer=rag_recursive_answer.answer,
+            context_text=rag_recursive_context.context_text or "",
+            retrieved_chunks=rag_recursive_context.retrieved_chunks or [],
+            subtopics=rag_recursive_answer.subtopics,
+            recursion=rag_recursive_answer.recursion,
+        ),
+        EvaluationRun(
+            name="rag_recursive_filtered",
+            input_type="rag recursive filtered",
+            answer=rag_recursive_filtered_answer.answer,
+            context_text=rag_recursive_filtered_context.context_text or "",
+            retrieved_chunks=rag_recursive_filtered_context.retrieved_chunks or [],
+            subtopics=rag_recursive_filtered_answer.subtopics,
+            recursion=rag_recursive_filtered_answer.recursion,
         ),
     ]
     embeddings = embedding_model.embed_documents([run.answer for run in runs])
@@ -253,7 +357,9 @@ def render_html_report(
 
 def _summary_table(runs: list[EvaluationRun]) -> str:
     rows = [
-        "<tr><th>Run</th><th>Transcript input type</th><th>Filter</th><th>Token estimate</th><th>Retrieved chunks</th><th>Answer chars</th></tr>"
+        "<tr><th>Run</th><th>Transcript input type</th><th>Filter</th>"
+        "<th>Token estimate</th><th>Retrieved chunks</th><th>Answer chars</th>"
+        "<th>LLM calls</th><th>Terminated</th></tr>"
     ]
     for run in runs:
         rows.append(
@@ -264,6 +370,8 @@ def _summary_table(runs: list[EvaluationRun]) -> str:
             f"<td class=\"metric\">{run.token_estimate}</td>"
             f"<td class=\"metric\">{len(run.retrieved_chunks)}</td>"
             f"<td class=\"metric\">{len(run.answer)}</td>"
+            f"<td class=\"metric\">{run.total_llm_calls}</td>"
+            f"<td>{html.escape(run.terminated_reason or '—')}</td>"
             "</tr>"
         )
     return "<table>" + "".join(rows) + "</table>"
@@ -288,19 +396,62 @@ def _run_section(run: EvaluationRun) -> str:
     )
     if not chunks:
         chunks = "<p>No retrieved chunks for raw transcript input.</p>"
-    return "\n".join(
-        [
-            "<article>",
-            f"<h3>{html.escape(run.name)} ({html.escape(run.input_type)})</h3>",
-            f"<p><strong>Filter:</strong> {html.escape(run.source_url or 'all indexed transcripts')}</p>",
-            f"<p><strong>Token estimate:</strong> <span class=\"metric\">{run.token_estimate}</span></p>",
-            "<h4>Answer</h4>",
-            f"<pre>{html.escape(run.answer)}</pre>",
-            "<h4>Retrieved chunks</h4>",
-            chunks,
-            "</article>",
-        ]
+    parts = [
+        "<article>",
+        f"<h3>{html.escape(run.name)} ({html.escape(run.input_type)})</h3>",
+        f"<p><strong>Filter:</strong> {html.escape(run.source_url or 'all indexed transcripts')}</p>",
+        f"<p><strong>Token estimate:</strong> <span class=\"metric\">{run.token_estimate}</span></p>",
+        "<h4>Answer</h4>",
+        f"<pre>{html.escape(run.answer)}</pre>",
+        "<h4>Retrieved chunks</h4>",
+        chunks,
+    ]
+    if run.recursion is not None:
+        parts.append(_recursion_trace_section(run.recursion))
+    parts.append("</article>")
+    return "\n".join(parts)
+
+
+def _recursion_trace_section(recursion: RecursionTrace) -> str:
+    stage_rows = "".join(
+        f"<tr><td>{html.escape(s.name)}</td>"
+        f"<td class=\"metric\">{s.llm_calls}</td>"
+        f"<td class=\"metric\">{s.retrievals}</td></tr>"
+        for s in recursion.stages
     )
+    stage_table = (
+        "<table><tr><th>Stage</th><th>LLM calls</th><th>Retrievals</th></tr>"
+        + stage_rows
+        + "</table>"
+    )
+    parts = [
+        "<h4>Recursion trace</h4>",
+        stage_table,
+        f"<p><strong>Terminated:</strong> {html.escape(recursion.terminated_reason)}</p>",
+        f"<p><strong>Follow-ups proposed:</strong> {recursion.total_followups_proposed}"
+        f" &nbsp;|&nbsp; <strong>executed:</strong> {recursion.total_followups_executed}</p>",
+    ]
+    if recursion.subtopic_answers:
+        parts.append("<h4>Subtopic drill-downs</h4>")
+        for sa in recursion.subtopic_answers:
+            parts.append(
+                "<details>"
+                f"<summary>{sa.subtopic_index}. {html.escape(sa.topic)}</summary>"
+                f"<p><strong>Follow-up query:</strong> {html.escape(sa.followup_query)}</p>"
+                f"<pre>{html.escape(sa.answer)}</pre>"
+                "</details>"
+            )
+    elif recursion.subtopic_evidence:
+        parts.append("<h4>Proposed follow-ups</h4>")
+        for ev in recursion.subtopic_evidence:
+            label = f"{ev.subtopic_index}. {ev.subtopic.topic} [{ev.outcome}]"
+            parts.append(
+                "<details>"
+                f"<summary>{html.escape(label)}</summary>"
+                f"<p><strong>Query:</strong> {html.escape(ev.subtopic.followup_query)}</p>"
+                "</details>"
+            )
+    return "\n".join(parts)
 
 
 def _chunk_details(index: int, chunk) -> str:
@@ -341,6 +492,8 @@ def _json_payload(
                 "source_url": run.source_url,
                 "answer": run.answer,
                 "token_estimate": run.token_estimate,
+                "total_llm_calls": run.total_llm_calls,
+                "terminated_reason": run.terminated_reason,
                 "retrieved_chunks": [
                     {
                         "rank": index,
@@ -357,6 +510,8 @@ def _json_payload(
                     }
                     for index, chunk in enumerate(run.retrieved_chunks, 1)
                 ],
+                "recursion": run.recursion.model_dump(mode="json") if run.recursion else None,
+                "subtopics": [s.model_dump(mode="json") for s in run.subtopics],
             }
             for run in runs
         ],

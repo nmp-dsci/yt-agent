@@ -227,6 +227,77 @@ def test_rag_ask_passes_transcript_filter_flags(monkeypatch, tmp_path, capsys) -
     assert "rag answer" in capsys.readouterr().out
 
 
+def test_rag_ask_passes_recursive_flags(monkeypatch, tmp_path, capsys) -> None:
+    _patch_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "RagTranscriptAgent", FakeRagAgent)
+    monkeypatch.setattr(cli, "HuggingFaceEmbeddingModel", FakeEmbeddingModel)
+    monkeypatch.setattr(cli, "TranscriptChunkStore", FakeChunkStore)
+    monkeypatch.setattr(cli, "RagIndexer", FakeIndexer)
+    monkeypatch.setattr(cli, "MultiTranscriptRagContextProvider", FakeMultiProvider)
+    FakeRagAgent.last_request = None
+
+    result = cli.main(
+        [
+            "rag-ask",
+            "question",
+            "--recursive",
+            "--max-depth",
+            "1",
+            "--max-followups",
+            "4",
+            "--followup-top-k",
+            "6",
+            "--novelty-min-chunks",
+            "1",
+            "--max-total-followups",
+            "5",
+        ]
+    )
+
+    assert result == 0
+    request = FakeRagAgent.last_request
+    assert request is not None
+    assert request.recursive is True
+    assert request.recursion_options.max_depth == 1
+    assert request.recursion_options.max_followups == 4
+    assert request.recursion_options.followup_top_k == 6
+    assert request.recursion_options.novelty_min_chunks == 1
+    assert request.recursion_options.max_total_followups == 5
+    assert "rag answer" in capsys.readouterr().out
+
+
+def test_rag_ask_uses_recursive_env_default_and_opt_out(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    settings = Settings(
+        superdata_api_key="super",
+        deepseek_api_key="deep",
+        deepseek_model="deepseek-v4",
+        deepseek_base_url=None,
+        chroma_path=tmp_path / "chroma",
+        mlflow_tracking_uri=f"file:{tmp_path / 'mlruns'}",
+        mlflow_experiment_name="test-cli",
+        log_transcript_artifacts=False,
+        rag_recursive_default=True,
+    )
+    _patch_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda require_keys=True: settings)
+    monkeypatch.setattr(cli, "RagTranscriptAgent", FakeRagAgent)
+    monkeypatch.setattr(cli, "HuggingFaceEmbeddingModel", FakeEmbeddingModel)
+    monkeypatch.setattr(cli, "TranscriptChunkStore", FakeChunkStore)
+    monkeypatch.setattr(cli, "RagIndexer", FakeIndexer)
+    monkeypatch.setattr(cli, "MultiTranscriptRagContextProvider", FakeMultiProvider)
+
+    FakeRagAgent.last_request = None
+    assert cli.main(["rag-ask", "question"]) == 0
+    assert FakeRagAgent.last_request.recursive is True
+
+    FakeRagAgent.last_request = None
+    assert cli.main(["rag-ask", "question", "--no-recursive"]) == 0
+    assert FakeRagAgent.last_request.recursive is False
+    capsys.readouterr()
+
+
 def test_index_rag_refreshes_pipeline_dashboard(monkeypatch, tmp_path, capsys) -> None:
     _patch_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "HuggingFaceEmbeddingModel", FakeEmbeddingModel)

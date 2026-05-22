@@ -19,6 +19,12 @@ def test_loads_settings_from_env_file(monkeypatch, tmp_path: Path) -> None:
                 "SUPADATA_TIMEOUT_SECONDS=150",
                 "SUPADATA_POLL_INTERVAL_SECONDS=3",
                 "SUPADATA_MAX_POLL_SECONDS=900",
+                "YT_AGENT_RAG_RECURSIVE_DEFAULT=true",
+                "YT_AGENT_RAG_MAX_DEPTH=1",
+                "YT_AGENT_RAG_MAX_FOLLOWUPS=4",
+                "YT_AGENT_RAG_FOLLOWUP_TOP_K=6",
+                "YT_AGENT_RAG_NOVELTY_MIN_CHUNKS=1",
+                "YT_AGENT_RAG_MAX_TOTAL_FOLLOWUPS=5",
             ]
         ),
         encoding="utf-8",
@@ -36,6 +42,12 @@ def test_loads_settings_from_env_file(monkeypatch, tmp_path: Path) -> None:
     assert settings.supadata_timeout_seconds == 150
     assert settings.supadata_poll_interval_seconds == 3
     assert settings.supadata_max_poll_seconds == 900
+    assert settings.rag_recursive_default is True
+    assert settings.rag_max_depth == 1
+    assert settings.rag_max_followups == 4
+    assert settings.rag_followup_top_k == 6
+    assert settings.rag_novelty_min_chunks == 1
+    assert settings.rag_max_total_followups == 5
 
 
 def test_accepts_supadata_api_key_alias(monkeypatch, tmp_path: Path) -> None:

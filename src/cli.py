@@ -8,7 +8,12 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 
 from src.agents.context import RawTranscriptContextProvider
-from src.agents.models import QuestionRequest, RagQuestionRequest, SummaryRequest
+from src.agents.models import (
+    QuestionRequest,
+    RagQuestionRequest,
+    RecursionOptions,
+    SummaryRequest,
+)
 from src.agents.rag_transcript_agent import RagTranscriptAgent
 from src.agents.transcript_agent import TranscriptAgent
 from src.config import ConfigError, load_settings
@@ -24,6 +29,7 @@ from src.observability import (
     log_context_comparison,
     log_context_details,
     log_raw_transcript_metadata,
+    log_recursion_trace,
     log_summary,
     log_transcript,
     log_transcript_filter_details,
@@ -109,6 +115,27 @@ def build_parser() -> argparse.ArgumentParser:
     rag_ask.add_argument("--filter-transcripts", action="store_true")
     rag_ask.add_argument("--transcript-filter-top-k", type=int, default=None)
     rag_ask.add_argument("--transcript-filter-min-score", type=float, default=None)
+    recursive_group = rag_ask.add_mutually_exclusive_group()
+    recursive_group.add_argument(
+        "--recursive",
+        dest="recursive",
+        action="store_true",
+        default=None,
+        help="Enable recursive multi-hop RAG",
+    )
+    recursive_group.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Disable recursive RAG even when enabled by env default",
+    )
+    rag_ask.add_argument("--max-depth", type=int, default=None)
+    rag_ask.add_argument("--max-followups", type=int, default=None)
+    rag_ask.add_argument("--followup-top-k", type=int, default=None)
+    rag_ask.add_argument("--novelty-min-chunks", type=int, default=None)
+    rag_ask.add_argument("--max-total-followups", type=int, default=None)
+    rag_ask.add_argument("--show-followups", action="store_true")
+    rag_ask.add_argument("--print-trace", action="store_true")
 
     return parser
 
@@ -374,6 +401,40 @@ def main(argv: list[str] | None = None) -> int:
                     if args.transcript_filter_min_score is not None
                     else settings.transcript_filter_min_score
                 )
+                recursive = (
+                    settings.rag_recursive_default
+                    if args.recursive is None
+                    else args.recursive
+                )
+                recursion_options = None
+                if recursive:
+                    recursion_options = RecursionOptions(
+                        max_depth=(
+                            args.max_depth
+                            if args.max_depth is not None
+                            else settings.rag_max_depth
+                        ),
+                        max_followups=(
+                            args.max_followups
+                            if args.max_followups is not None
+                            else settings.rag_max_followups
+                        ),
+                        followup_top_k=(
+                            args.followup_top_k
+                            if args.followup_top_k is not None
+                            else settings.rag_followup_top_k
+                        ),
+                        novelty_min_chunks=(
+                            args.novelty_min_chunks
+                            if args.novelty_min_chunks is not None
+                            else settings.rag_novelty_min_chunks
+                        ),
+                        max_total_followups=(
+                            args.max_total_followups
+                            if args.max_total_followups is not None
+                            else settings.rag_max_total_followups
+                        ),
+                    )
                 answer = agent.answer(
                     RagQuestionRequest(
                         question=args.question,
@@ -384,6 +445,8 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         transcript_filter_top_k=filter_top_k,
                         transcript_filter_min_score=filter_min_score,
+                        recursive=recursive,
+                        recursion_options=recursion_options,
                     )
                 )
                 if agent.last_context is not None:
@@ -402,12 +465,15 @@ def main(argv: list[str] | None = None) -> int:
                         min_score=filter_min_score,
                         retrieved_chunks=agent.last_context.retrieved_chunks,
                     )
+                log_recursion_trace(answer.recursion)
                 print(
                     _format_rag_answer(
                         answer,
                         selected_transcripts=agent.last_context.selected_transcripts
                         if agent.last_context is not None
                         else [],
+                        show_followups=args.show_followups or recursive,
+                        print_trace=args.print_trace,
                     )
                 )
                 return 0
@@ -483,7 +549,12 @@ def _format_comparison(comparison) -> str:
     )
 
 
-def _format_rag_answer(answer, selected_transcripts=None) -> str:
+def _format_rag_answer(
+    answer,
+    selected_transcripts=None,
+    show_followups: bool = False,
+    print_trace: bool = False,
+) -> str:
     lines = []
     if selected_transcripts:
         lines.append("Selected transcripts")
@@ -517,6 +588,43 @@ def _format_rag_answer(answer, selected_transcripts=None) -> str:
                 f"{reference.label} {reference.timestamp_url} "
                 f"{start}-{end}s video={reference.video_id}"
             )
+    if show_followups and answer.subtopics:
+        lines.extend(["", "Proposed follow-ups"])
+        for index, subtopic in enumerate(answer.subtopics, 1):
+            lines.append(
+                f"{index}. {subtopic.topic} "
+                f"(confidence {subtopic.confidence:.2f})"
+            )
+            lines.append(f'   query: "{subtopic.followup_query}"')
+    if answer.recursion is not None:
+        trace = answer.recursion
+        lines.extend(["", "Recursion trace"])
+        stage_text = ", ".join(
+            f"{stage.name} ({stage.llm_calls} LLM, {stage.retrievals} retrievals)"
+            for stage in trace.stages
+        )
+        lines.append(f"Stages: {stage_text}")
+        lines.append(f"Terminated: {trace.terminated_reason}")
+        lines.append(f"Follow-ups proposed: {trace.total_followups_proposed}")
+        lines.append(f"Follow-ups executed: {trace.total_followups_executed}")
+        lines.append(
+            f"Total LLM calls: {sum(stage.llm_calls for stage in trace.stages)}"
+        )
+        if print_trace and trace.subtopic_evidence:
+            lines.append("")
+            lines.append("Trace chunks")
+            for item in trace.subtopic_evidence:
+                lines.append(
+                    f"{item.subtopic_index}. {item.subtopic.topic} "
+                    f"outcome={item.outcome} chunks={len(item.chunks)}"
+                )
+                lines.append(f'   query: "{item.subtopic.followup_query}"')
+                for chunk in item.chunks:
+                    preview = (chunk.text or "").replace("\n", " ")[:120]
+                    lines.append(
+                        f"   - video={chunk.video_id} chunk={chunk.chunk_index}: "
+                        f"{preview}"
+                    )
     return "\n".join(lines)
 
 

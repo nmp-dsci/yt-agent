@@ -9,7 +9,7 @@ from typing import Iterator
 
 import mlflow
 
-from src.agents.models import TranscriptAnswer, TranscriptSummary
+from src.agents.models import RecursionTrace, TranscriptAnswer, TranscriptSummary
 from src.config import Settings
 from src.rag.models import (
     ContextComparisonResult,
@@ -87,6 +87,23 @@ def log_summary(summary: TranscriptSummary) -> None:
 
 def log_answer(answer: TranscriptAnswer) -> None:
     _log_json_artifact(answer.model_dump(), "answer.json")
+
+
+def log_recursion_trace(trace: RecursionTrace | None) -> None:
+    if trace is None:
+        return
+    mlflow.log_param("rag_recursion_terminated_reason", trace.terminated_reason)
+    mlflow.log_metric("rag_followups_proposed", trace.total_followups_proposed)
+    mlflow.log_metric("rag_followups_executed", trace.total_followups_executed)
+    mlflow.log_metric(
+        "rag_recursion_llm_calls",
+        sum(stage.llm_calls for stage in trace.stages),
+    )
+    mlflow.log_metric(
+        "rag_recursion_retrievals",
+        sum(stage.retrievals for stage in trace.stages),
+    )
+    _log_json_artifact(trace.model_dump(mode="json"), "rag_recursion_trace.json")
 
 
 def log_context_details(

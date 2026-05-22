@@ -28,6 +28,12 @@ class Settings:
     rag_top_k: int = 10
     transcript_filter_top_k: int = 5
     transcript_filter_min_score: float = 0.25
+    rag_recursive_default: bool = False
+    rag_max_depth: int = 1
+    rag_max_followups: int = 3
+    rag_followup_top_k: int | None = None
+    rag_novelty_min_chunks: int = 2
+    rag_max_total_followups: int | None = None
     chunk_target_chars: int = 1200
     chunk_overlap_chars: int = 150
     supadata_timeout_seconds: float = 120.0
@@ -57,6 +63,16 @@ def _int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None or value == "":
         return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+
+
+def _optional_int_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
     try:
         return int(value)
     except ValueError as exc:
@@ -132,6 +148,14 @@ def load_settings(require_keys: bool = True) -> Settings:
         transcript_filter_min_score=_float_env(
             "YT_AGENT_TRANSCRIPT_FILTER_MIN_SCORE", 0.25
         ),
+        rag_recursive_default=_bool_env(
+            os.environ.get("YT_AGENT_RAG_RECURSIVE_DEFAULT"), default=False
+        ),
+        rag_max_depth=_int_env("YT_AGENT_RAG_MAX_DEPTH", 1),
+        rag_max_followups=_int_env("YT_AGENT_RAG_MAX_FOLLOWUPS", 3),
+        rag_followup_top_k=_optional_int_env("YT_AGENT_RAG_FOLLOWUP_TOP_K"),
+        rag_novelty_min_chunks=_int_env("YT_AGENT_RAG_NOVELTY_MIN_CHUNKS", 2),
+        rag_max_total_followups=_optional_int_env("YT_AGENT_RAG_MAX_TOTAL_FOLLOWUPS"),
         chunk_target_chars=_int_env("YT_AGENT_CHUNK_TARGET_CHARS", 1200),
         chunk_overlap_chars=_int_env("YT_AGENT_CHUNK_OVERLAP_CHARS", 150),
         supadata_timeout_seconds=_float_env("SUPADATA_TIMEOUT_SECONDS", 120.0),

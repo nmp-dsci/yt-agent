@@ -36,6 +36,12 @@ YT_AGENT_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 YT_AGENT_RAG_TOP_K=10
 YT_AGENT_TRANSCRIPT_FILTER_TOP_K=5
 YT_AGENT_TRANSCRIPT_FILTER_MIN_SCORE=0.25
+YT_AGENT_RAG_RECURSIVE_DEFAULT=false
+YT_AGENT_RAG_MAX_DEPTH=1
+YT_AGENT_RAG_MAX_FOLLOWUPS=3
+YT_AGENT_RAG_FOLLOWUP_TOP_K=
+YT_AGENT_RAG_NOVELTY_MIN_CHUNKS=2
+YT_AGENT_RAG_MAX_TOTAL_FOLLOWUPS=
 YT_AGENT_CHUNK_TARGET_CHARS=1200
 YT_AGENT_CHUNK_OVERLAP_CHARS=150
 YT_AGENT_DISCOVERY_CACHE_TTL_HOURS=24
@@ -50,6 +56,8 @@ YT_AGENT_LOG_TRANSCRIPT_ARTIFACTS=false
 `SUPADATA_API_KEY` is used with the Supadata transcript API. DeepSeek is called through the OpenAI-compatible LangChain client.
 
 Supadata can return async jobs for longer videos. `SUPADATA_MAX_POLL_SECONDS=600` lets indexing wait up to 10 minutes for those jobs before timing out.
+
+Recursion env vars are used only when recursive mode is effectively on via `--recursive` or `YT_AGENT_RAG_RECURSIVE_DEFAULT=true`. Empty `YT_AGENT_RAG_FOLLOWUP_TOP_K` defaults follow-up retrieval to `YT_AGENT_RAG_TOP_K`; empty `YT_AGENT_RAG_MAX_TOTAL_FOLLOWUPS` defaults to `max_depth * max_followups`.
 
 ### Command Sequence
 
@@ -184,37 +192,71 @@ dashboard/rag_pipeline.html
 
 #### 4. Ask questions
 
-Ask against a full raw transcript:
+Full transcript (raw): sends the whole single-video transcript to the LLM.
 
 ```bash
 uv run python -m src.cli ask "$url" "$question" --context raw
 ```
 
-Ask with RAG restricted to one transcript:
+Single-transcript RAG: retrieves chunks from one video before calling the LLM.
 
 ```bash
 uv run python -m src.cli ask "$url" "$question" --context rag --top-k 10
 ```
 
-Ask with the RAG-only multi-transcript agent across all indexed transcripts:
+Multi-transcript RAG (single-hop): retrieves chunks across every indexed video, or restricts the same agent to one URL with `--url`.
 
 ```bash
 question="how do ai engineers leveage claude to fully develop features and only set & review"
 
 uv run python -m src.cli rag-ask "$question" --top-k 20
+uv run python -m src.cli rag-ask "$question" --url "$url" --top-k 10
 ```
 
-Ask across indexed transcripts with transcript-summary filtering before chunk retrieval:
+Multi-transcript RAG (single-hop, summary-filtered): first selects relevant transcript summaries, then retrieves chunks only from those videos.
 
 ```bash
 uv run python -m src.cli rag-ask "$question" --filter-transcripts --top-k 20
+uv run python -m src.cli rag-ask "$question" --filter-transcripts \
+  --transcript-filter-top-k 8 --transcript-filter-min-score 0.3 --top-k 20
 ```
 
-Ask with the RAG-only agent restricted to one transcript:
+Multi-transcript RAG (single-hop, show follow-ups): still performs one retrieval and one LLM call, but prints the model's proposed follow-up retrieval queries.
 
 ```bash
-uv run python -m src.cli rag-ask "$question" --url "$url" --top-k 10
+uv run python -m src.cli rag-ask "$question" --show-followups
+uv run python -m src.cli rag-ask "$question" --url "$url" --show-followups
+uv run python -m src.cli rag-ask "$question" --filter-transcripts --show-followups
 ```
+
+Multi-transcript RAG (recursive): acts on follow-up queries with bounded fan-out retrieval, then runs a final synthesis call.
+
+```bash
+uv run python -m src.cli rag-ask "$question" --recursive
+uv run python -m src.cli rag-ask "$question" --recursive --url "$url"
+uv run python -m src.cli rag-ask "$question" --recursive --filter-transcripts
+uv run python -m src.cli rag-ask "$question" --recursive \
+  --max-depth 1 --max-followups 4 --top-k 15 --followup-top-k 10
+uv run python -m src.cli rag-ask "$question" --recursive \
+  --max-total-followups 6 --novelty-min-chunks 3
+uv run python -m src.cli rag-ask "$question" --recursive --print-trace
+uv run python -m src.cli rag-ask "$question" --recursive --filter-transcripts \
+  --url "$url" --max-followups 3 --print-trace
+```
+
+With `YT_AGENT_RAG_RECURSIVE_DEFAULT=true`, `rag-ask "$question"` runs recursively by default. Use `--no-recursive` to force the single-hop path.
+
+Recursive RAG flags:
+
+- `--recursive` — enable recursive multi-hop RAG; default is off unless `YT_AGENT_RAG_RECURSIVE_DEFAULT=true`.
+- `--no-recursive` — disable recursive RAG even when the env default is on.
+- `--max-depth N` — default `1`; S6 implements `0` and `1`, where `0` collapses to single-hop.
+- `--max-followups N` — default `3`; maximum follow-up queries selected from the first pass.
+- `--followup-top-k N` — default is `--top-k`; chunks retrieved for each follow-up query.
+- `--novelty-min-chunks N` — default `2`; minimum new chunks required to include a follow-up in synthesis.
+- `--max-total-followups N` — default `max_depth * max_followups`; hard cap on fan-out retrievals.
+- `--show-followups` — print proposed follow-up queries in single-hop mode.
+- `--print-trace` — print per-follow-up chunk previews in recursive mode.
 
 Summarize one transcript:
 
@@ -246,14 +288,25 @@ Open:
 dashboard/evaluation.html
 ```
 
+The report compares six variants in one run:
+
+| Variant | Description |
+|---|---|
+| `raw_single` | Full transcript sent to the LLM (token baseline). |
+| `rag_single` | Top-K chunks from the selected video only. |
+| `rag_all` | Top-K chunks across all indexed videos (single-hop). |
+| `rag_all_filtered` | Summary-filtered transcripts, then top-K chunks (single-hop). |
+| `rag_recursive` | Multi-hop: first-pass + fan-out retrieval + synthesis (all transcripts). |
+| `rag_recursive_filtered` | Multi-hop with summary filtering applied at every hop. |
+
 The report shows:
 
-- Raw answer from the full transcript.
-- RAG answer from top 10 chunks for the selected video.
-- RAG answer from top 10 chunks across all indexed videos.
-- Prompt token estimates for each mode.
+- Answers for all six variants.
+- Prompt token estimates and retrieved chunk counts for each.
+- LLM call count and recursion terminated reason for recursive variants.
 - Pairwise embedding similarity between answers.
 - Expandable retrieved chunks with source URL and timestamp links.
+- Recursion trace (stages, proposed/executed follow-ups, subtopic drill-downs) for recursive variants.
 
 ### Architecture
 
@@ -261,7 +314,7 @@ The report shows:
 src/
   transcripts/   # YouTube URL parsing, Supadata fetching, transcript models/storage
   rag/           # Raw segment storage, chunking, embeddings, retrieval, references
-  agents/        # Full-transcript agent and RAG-only transcript agent
+  agents/        # Full-transcript agent and RAG agent with optional recursive multi-hop retrieval
   evals/         # Demo/evaluation scripts and HTML report generation
   dashboard/     # Local HTML dashboards for reviewing indexed RAG state
 tests/
@@ -280,7 +333,9 @@ The legacy `transcripts` collection may exist from earlier prototype work, but c
 There are two agent paths:
 
 - `TranscriptAgent`: supports full raw transcript prompting and single-video RAG comparison.
-- `RagTranscriptAgent`: RAG-only agent that can search all indexed transcript chunks or filter to one URL.
+- `RagTranscriptAgent`: RAG agent that can search all indexed transcript chunks, filter to one URL, and optionally run recursive multi-hop retrieval.
+
+`RagTranscriptAgent` uses a unified first-pass LLM contract in both modes: the prompt always asks for an answer with references plus proposed subtopics and follow-up retrieval queries. Single-hop mode returns those follow-ups only when requested by `--show-followups`; recursive mode acts on them with extra retrieval and a final synthesis call.
 
 Indexing flow:
 
@@ -337,7 +392,7 @@ User question
   -> transcript_chunks vector search across all indexed videos
   -> format top 10 chunks with video URLs and timestamp links
   -> DeepSeek LLM
-  -> answer with source references
+  -> answer with source references + proposed follow-ups
 ```
 
 All-transcript RAG is the demo path for asking across the indexed corpus. It can be filtered back to one transcript with:
@@ -358,6 +413,21 @@ User question
   -> DeepSeek LLM
   -> answer with source references
 ```
+
+Recursive RAG flow:
+
+```text
+User question
+  -> src.cli rag-ask --recursive
+  -> retrieve initial chunks with MultiTranscriptRagContextProvider
+  -> first-pass DeepSeek call: answer + references + follow-up subtopics
+  -> for each selected follow-up query, retrieve more chunks through the same provider
+  -> drop duplicate or low-novelty follow-up evidence
+  -> final DeepSeek synthesis call
+  -> layered answer + combined references + recursion trace
+```
+
+Recursive mode inherits `--url` and `--filter-transcripts` because every hop reuses the same context provider and request filters.
 
 Evaluation flow:
 
